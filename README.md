@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # misconfig-ConfigEncryptionChecker
 A CLI tool that verifies if sensitive data within configuration files (e.g., passwords, API keys) are encrypted using a secure method. Leverages `cryptography` library to detect encryption and assess its strength. - Focused on Check for misconfigurations in configuration files or infrastructure definitions
 
