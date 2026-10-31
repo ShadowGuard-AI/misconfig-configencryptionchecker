@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import sys
 import json
 import yaml
 from cryptography.fernet import Fernet, InvalidToken
@@ -13,20 +14,30 @@ import re
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Key names that mark a value as sensitive. A plain value under one of
+# these names is the case this tool exists to catch.
+SENSITIVE_KEY_PARTS = (
+    "password", "passwd", "pwd", "api_key", "apikey", "api-key",
+    "secret", "token", "private_key", "private-key", "credential",
+    "auth_key", "access_key",
+)
+
+WEAK_KEY_PATTERNS = [
+    "password",
+    "12345",
+    "admin",
+    "secret",
+    "test",
+]
+
 
 def setup_argparse():
-    """
-    Sets up the argument parser for the CLI tool.
-
-    Returns:
-        argparse.ArgumentParser: The configured argument parser.
-    """
     parser = argparse.ArgumentParser(description="Verify encryption of sensitive data in configuration files.")
     parser.add_argument("config_file", help="Path to the configuration file.")
     parser.add_argument(
         "--encryption_key",
         help="Encryption key (if applicable).  If not provided, the tool will attempt to detect common key patterns.",
-        required=False,  # Make encryption_key optional
+        required=False,
     )
     parser.add_argument(
         "--file_type",
@@ -39,27 +50,13 @@ def setup_argparse():
         action="store_true",
         help="Enable detection of weak encryption keys or patterns (e.g., 'password', '12345').",
     )
-
     return parser
 
 
 def load_config_file(config_file_path, file_type=None):
-    """
-    Loads the configuration file based on its type (JSON or YAML).
-
-    Args:
-        config_file_path (str): Path to the configuration file.
-        file_type (str, optional): Explicitly specify the file type ("yaml" or "json"). If None, it will attempt to infer the file type from the extension.
-
-    Returns:
-        dict: The loaded configuration data as a dictionary.
-        None: If the file type is not supported, or if there's an error loading the file.
-    """
-
     if file_type is None:
         _, file_extension = os.path.splitext(config_file_path)
         file_extension = file_extension.lstrip(".").lower()
-
         if file_extension == "json":
             file_type = "json"
         elif file_extension in ("yaml", "yml"):
@@ -67,7 +64,6 @@ def load_config_file(config_file_path, file_type=None):
         else:
             logging.error(f"Unsupported file type: {file_extension}")
             return None
-
     try:
         with open(config_file_path, "r") as f:
             if file_type == "json":
@@ -75,7 +71,7 @@ def load_config_file(config_file_path, file_type=None):
             elif file_type == "yaml":
                 return yaml.safe_load(f)
             else:
-                logging.error(f"Unsupported file type: {file_type}")  # Redundant check but good for clarity
+                logging.error(f"Unsupported file type: {file_type}")
                 return None
     except FileNotFoundError:
         logging.error(f"File not found: {config_file_path}")
@@ -88,119 +84,144 @@ def load_config_file(config_file_path, file_type=None):
         return None
 
 
-def detect_encryption(value, encryption_key=None, detect_weak_keys=False):
-    """
-    Detects if a value is potentially encrypted using Fernet or a similar method.
-    Also detects weak keys if requested.
-
-    Args:
-        value (str): The value to check for encryption.
-        encryption_key (str, optional): Encryption key to attempt decryption. Defaults to None.
-        detect_weak_keys (bool): If True, will perform weak key detection.
-
-    Returns:
-        bool: True if encryption is detected (or seems likely), False otherwise.
-    """
-    if not isinstance(value, str):
-        return False
-
-    # Check for Fernet format (base64 encoded with "gAAAAAB" prefix)
-    if value.startswith("gAAAAAB"):
-        try:
-            if encryption_key:  # Try decrypting if key is provided
-                f = Fernet(encryption_key.encode())
-                f.decrypt(value.encode())  # Test decryption - no actual use of the decrypted value
-                logging.info("Possible encrypted value detected and successfully decrypted with the provided key.")
-                return True
-            else:
-                 logging.warning("Possible encrypted value detected but no encryption key provided.  Unable to verify.")
-                 return True # Return True so it flags it as potential encryption
-        except InvalidToken:
-            logging.warning("Possible encrypted value detected, but decryption failed with the provided key (InvalidToken).")
-            return False
-        except Exception as e:
-            logging.error(f"Error during decryption attempt: {e}")
-            return False
-
-    # Check for base64 encoded strings, which is a common encryption output
-    if is_base64(value):
-        logging.warning("Possible Base64 encoded value detected.  It MAY be encrypted, but this is not guaranteed.")
-        return True # Treat as potential encryption to encourage manual review
-
-    #Weak Key Detection (OPTIONAL)
-    if detect_weak_keys:
-        weak_key_patterns = [
-            "password",
-            "12345",
-            "admin",
-            "secret",
-            "test"
-        ]
-
-        value_lower = value.lower()  # Case-insensitive matching
-        for pattern in weak_key_patterns:
-            if pattern in value_lower:
-                logging.warning(f"Possible use of weak key pattern '{pattern}' detected in value: {value}")
-                return True  # Flag it, as it might contain a weak key or related information.
-
-    return False
+def is_sensitive_key(path):
+    leaf = re.split(r"[.\[\]]", path)[-1] if path else ""
+    leaf = leaf.lower()
+    return any(part in leaf for part in SENSITIVE_KEY_PARTS)
 
 
 def is_base64(s):
     """
-    Checks if a string is likely base64 encoded.
+    Strict base64 check: valid alphabet and padding, canonical form,
+    and long enough to be more than a short plain word.
     """
+    if not isinstance(s, str) or len(s) < 16 or len(s) % 4 != 0:
+        return False
     try:
-        base64.b64decode(s)
-        return True
+        decoded = base64.b64decode(s, validate=True)
     except Exception:
         return False
+    return base64.b64encode(decoded).decode() == s
 
 
-def traverse_config(config_data, encryption_key=None, detect_weak_keys=False, path=""):
+def classify_value(value, path, encryption_key=None, detect_weak_keys=False):
     """
-    Recursively traverses the configuration data to detect potentially encrypted values.
+    Classify one string value. Returns one of:
+    verified, encrypted_unverified, possible_encrypted, weak,
+    unencrypted_sensitive, none.
 
-    Args:
-        config_data (dict or list): The configuration data to traverse.
-        encryption_key (str, optional): Encryption key to attempt decryption. Defaults to None.
-        detect_weak_keys (bool): If True, will perform weak key detection.
-        path (str): The current path in the configuration (for logging).
+    The value itself is never logged here or anywhere else. Callers
+    report the key path and this kind only.
     """
+    if not isinstance(value, str) or value == "":
+        return "none"
 
+    if value.startswith("gAAAAAB"):
+        if encryption_key:
+            try:
+                f = Fernet(encryption_key.encode())
+                f.decrypt(value.encode())  # Decrypted bytes are discarded, never logged or written.
+                logging.info(f"Encrypted value verified with the provided key at: {path}")
+                return "verified"
+            except InvalidToken:
+                # A Fernet shaped value that this key cannot open is
+                # still encrypted shaped; report it as encrypted but
+                # unverified, not as absent.
+                logging.warning(f"Encrypted value at {path} could not be verified with the provided key.")
+                return "encrypted_unverified"
+            except Exception as e:
+                logging.error(f"Error during decryption attempt at {path}: {e}")
+                return "encrypted_unverified"
+        logging.warning(f"Encrypted value at {path} cannot be verified: no encryption key provided.")
+        return "encrypted_unverified"
+
+    if detect_weak_keys:
+        value_lower = value.lower()
+        for pattern in WEAK_KEY_PATTERNS:
+            if pattern in value_lower:
+                logging.warning(f"Weak pattern detected at: {path}")
+                return "weak"
+
+    sensitive = is_sensitive_key(path)
+
+    if is_base64(value):
+        if sensitive:
+            logging.warning(f"Possible encrypted value (base64 shaped, unverified) at: {path}")
+            return "possible_encrypted"
+        # A base64 decodable string under an ordinary key name is not
+        # called encryption. Plenty of plain values decode as base64.
+        return "none"
+
+    if sensitive:
+        logging.warning(f"Sensitive value at {path} does not match any encryption shape: reported as unencrypted.")
+        return "unencrypted_sensitive"
+
+    return "none"
+
+
+def detect_encryption(value, encryption_key=None, detect_weak_keys=False):
+    """Kept for compatibility: True when a value is encryption shaped."""
+    return classify_value(value, "", encryption_key, detect_weak_keys) in (
+        "verified", "encrypted_unverified", "possible_encrypted")
+
+
+def traverse_config(config_data, encryption_key=None, detect_weak_keys=False, path="", findings=None, stats=None):
+    """
+    Walk the config and collect findings as (path, kind) pairs.
+    Values are never placed in a finding.
+    """
+    if findings is None:
+        findings = []
+    if stats is None:
+        stats = {"checked": 0}
     if isinstance(config_data, dict):
         for key, value in config_data.items():
-            current_path = f"{path}.{key}" if path else key
-            traverse_config(value, encryption_key, detect_weak_keys, current_path)  # Recursive call
+            current_path = f"{path}.{key}" if path else str(key)
+            traverse_config(value, encryption_key, detect_weak_keys, current_path, findings, stats)
     elif isinstance(config_data, list):
         for i, item in enumerate(config_data):
             current_path = f"{path}[{i}]"
-            traverse_config(item, encryption_key, detect_weak_keys, current_path)  # Recursive call
+            traverse_config(item, encryption_key, detect_weak_keys, current_path, findings, stats)
     elif isinstance(config_data, str):
-        if detect_encryption(config_data, encryption_key, detect_weak_keys):
-            logging.warning(f"Possible encrypted value detected at: {path} = {config_data}")
-    else:
-        pass # Ignore non-string/list/dict values
+        stats["checked"] += 1
+        kind = classify_value(config_data, path, encryption_key, detect_weak_keys)
+        if kind not in ("none", "verified"):
+            findings.append((path, kind))
+    return findings, stats
+
+
+# Kinds that fail the run: a gate must be able to trust the exit code.
+FAILING_KINDS = ("unencrypted_sensitive", "encrypted_unverified", "possible_encrypted", "weak")
 
 
 def main():
-    """
-    Main function to execute the misconfiguration detection tool.
-    """
     parser = setup_argparse()
     args = parser.parse_args()
 
     if not os.path.exists(args.config_file):
         logging.error(f"Configuration file not found: {args.config_file}")
-        return
+        sys.exit(1)
 
     config_data = load_config_file(args.config_file, args.file_type)
     if config_data is None:
-        return
+        logging.error("Nothing was checked: the configuration could not be loaded or is empty.")
+        sys.exit(1)
 
-    traverse_config(config_data, args.encryption_key, args.detect_weak_keys)
+    findings, stats = traverse_config(config_data, args.encryption_key, args.detect_weak_keys)
+
+    if stats["checked"] == 0:
+        logging.error("Nothing was checked: the configuration holds no string values.")
+        sys.exit(1)
+
+    for path, kind in findings:
+        logging.warning(f"Finding at {path}: {kind}")
 
     logging.info("Misconfiguration detection completed.")
+
+    if any(kind in FAILING_KINDS for _, kind in findings):
+        sys.exit(1)
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
