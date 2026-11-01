@@ -85,6 +85,11 @@ def load_config_file(config_file_path, file_type=None):
 
 
 def is_sensitive_key(path):
+    # Only the leaf of the path is tested, and the test is a plain
+    # substring search. A key named secretary trips the secret part,
+    # and a long key that merely ends in a sensitive word counts the
+    # same as one that is exactly that word. Nesting a password
+    # under an innocent leaf name hides it from me completely.
     leaf = re.split(r"[.\[\]]", path)[-1] if path else ""
     leaf = leaf.lower()
     return any(part in leaf for part in SENSITIVE_KEY_PARTS)
@@ -116,6 +121,11 @@ def classify_value(value, path, encryption_key=None, detect_weak_keys=False):
     if not isinstance(value, str) or value == "":
         return "none"
 
+    # That prefix is the Fernet token shape, and it is the only
+    # encryption format I recognise on sight. A value encrypted
+    # some other way and stored as plain base64 gets at best the
+    # possible label below, and one stored in hex gets called
+    # unencrypted, however strong the scheme behind it was.
     if value.startswith("gAAAAAB"):
         if encryption_key:
             try:
@@ -123,6 +133,10 @@ def classify_value(value, path, encryption_key=None, detect_weak_keys=False):
                 f.decrypt(value.encode())  # Decrypted bytes are discarded, never logged or written.
                 logging.info(f"Encrypted value verified with the provided key at: {path}")
                 return "verified"
+            # A key in the wrong format raises ValueError from the Fernet
+            # constructor rather than InvalidToken, and lands in the broad
+            # handler below. Both routes end at the same unverified label,
+            # so the log is the only place the distinction survives.
             except InvalidToken:
                 # A Fernet shaped value that this key cannot open is
                 # still encrypted shaped; report it as encrypted but
@@ -138,6 +152,12 @@ def classify_value(value, path, encryption_key=None, detect_weak_keys=False):
     if detect_weak_keys:
         value_lower = value.lower()
         for pattern in WEAK_KEY_PATTERNS:
+            # These patterns match as substrings, not as whole values, and
+            # this check runs on every string in the file when the flag is
+            # set, not just under sensitive keys. The word latest contains
+            # test, so an ordinary version string can come back as a weak
+            # key finding. I keep the patterns blunt because a weak value
+            # hiding inside a longer one is also worth surfacing.
             if pattern in value_lower:
                 logging.warning(f"Weak pattern detected at: {path}")
                 return "weak"
@@ -161,6 +181,11 @@ def classify_value(value, path, encryption_key=None, detect_weak_keys=False):
 
 def detect_encryption(value, encryption_key=None, detect_weak_keys=False):
     """Kept for compatibility: True when a value is encryption shaped."""
+    # The empty path here means this wrapper can never see a
+    # sensitive key, so the base64 branch inside classify_value
+    # returns none for it and possible_encrypted is unreachable
+    # through this function. Only the Fernet branch can make it
+    # return True. It stays because older callers import the name.
     return classify_value(value, "", encryption_key, detect_weak_keys) in (
         "verified", "encrypted_unverified", "possible_encrypted")
 
@@ -183,6 +208,11 @@ def traverse_config(config_data, encryption_key=None, detect_weak_keys=False, pa
             current_path = f"{path}[{i}]"
             traverse_config(item, encryption_key, detect_weak_keys, current_path, findings, stats)
     elif isinstance(config_data, str):
+        # Only strings are counted, and only strings are classified.
+        # A config whose sensitive values are numbers, like a numeric
+        # PIN stored as an integer, contributes nothing to this count
+        # and nothing to the findings, which is a gap a reader of the
+        # summary number alone would never suspect.
         stats["checked"] += 1
         kind = classify_value(config_data, path, encryption_key, detect_weak_keys)
         if kind not in ("none", "verified"):
